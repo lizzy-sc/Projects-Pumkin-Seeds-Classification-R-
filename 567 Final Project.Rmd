@@ -1,0 +1,1225 @@
+---
+title: "567 Stat Modeling Final Project Pumkin Seeds Classification"
+author: "Jiechun Lin, Yifei Chen, Sitong Liu"
+date: "2023-04-21"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+# Load all the needed packages
+library(readxl)
+library(tidyverse)
+library(corrplot)
+library(ggplot2)
+library(caret)
+library(rjags)
+library(glmnet)
+library(rstan)
+library(bayesplot)
+library(knitr)
+library(gridExtra)
+library(MASS)
+
+load("Stan_8mod.Rdata")
+# The MCMC process in rstan can be time-consuming. To avoid extensive waiting times, please load the provided  "Stan_8mod.Rdata" file, which should be placed in the same working directory as this R Markdown document. If you are interested in experimenting with the code, please comment out the code in all the rstan sections. 
+```
+
+# 1. Data Exploration and Pre-prossessing 
+(1) Data Summary
+```{r}
+pumkin <- read_excel("Pumpkin_Seeds_Dataset.xlsx")
+str(pumkin)
+names(pumkin) # print the 12 morphological features
+anyNA(pumkin)
+
+# set 'Çerçevelik' as 1, 'Urgup Sivrisi' as 0
+pumkin <- pumkin %>% mutate(class=ifelse(Class=="Çerçevelik", 1, 0)) %>% dplyr::select(-Class) 
+head(pumkin)
+
+# Proportion of classes 
+table(pumkin$class)
+
+# summary of the 12 features
+summary(pumkin[,-1])
+
+```
+(2) Data multi-collinearity.
+The correlation plots imply that the features have severe collinearity.
+
+```{r fig.width=12, fig.height=12}
+pairs(pumkin)
+Cor = cor(pumkin)
+
+corrplot(Cor, type="upper", method="ellipse", tl.pos="d",tl.cex = 0.5) 
+corrplot(Cor, type="lower", method="number", col="black",
+          add=TRUE, diag=FALSE, tl.pos="n", cl.pos="n")
+
+```
+(3) Density plot of each feature in terms of classes.
+
+It seems that there is a noticeable difference between classes in the following features: "Major_Axis_Length", "Minor_Axis_Length", "Eccentricity", "Roundness", "Aspect_Ratio", and "Compactness".
+```{r}
+
+# Create a list of variable names, excluding the 'type' variable
+variable_names <- colnames(pumkin)[colnames(pumkin) != "class"]
+
+# Loop through the variable names and create a density plot for each
+for (var_name in variable_names) {
+  plot <- ggplot(pumkin, aes_string(x = var_name, fill = "factor(class)")) +
+    geom_density(alpha = 0.5) +
+    labs(title = paste("Density plot of", var_name, "by type"),
+         x = var_name,
+         fill = "class") +
+    theme_minimal()
+  
+  print(plot)
+}
+
+```
+
+(4) Normalizing the Data.
+
+```{r}
+X = scale(pumkin[,-13], center=TRUE, scale=TRUE)
+colMeans(X)
+apply(X, 2, sd)
+```
+(5) Train-Test split
+```{r}
+# Split the data without removing the outliers
+set.seed(123)
+
+X_df <- as.data.frame(X)
+norm_pumkin <- cbind(X_df, class = pumkin$class)
+
+# Perform a stratified train-test split
+train_idx <- createDataPartition(norm_pumkin$class, p = 0.8, list = FALSE)
+
+# Create the training and testing sets
+train_set <- norm_pumkin[train_idx, ]
+test_set <- norm_pumkin[-train_idx, ]
+cat("train_set:")
+table(train_set$class)
+cat("test_set:")
+table(test_set$class)
+
+X_train <- train_set[,-13]
+X_test <- test_set[,-13]
+```
+(6) Remove outliers
+
+```{r}
+mahalanobis_distances <- mahalanobis(X_train, colMeans(X_train), cov(X_train))
+threshold <- qchisq(0.975, df = ncol(X_train))
+outlier_rows <- which(mahalanobis_distances > threshold)
+X_clean <- X_train[-outlier_rows, ] # train set without outliers
+
+class_clean <- train_set$class[-outlier_rows]
+cleaned_train_set <- cbind(X_clean, class_clean)
+
+boxplot(X_train,main ='Before Removing Outliers')
+boxplot(X_clean,main ='After Removing Outliers')
+```
+
+2. Model fitting.
+(1)Logistic Lasso Model
+a) Train the model with the data before removing outliers
+```{r}
+library(caret)
+
+train_lasso_model <- function(train_set, lambda_range, length.out) {
+  y_train <- as.factor(train_set[, 13])
+  levels(y_train) <- make.names(levels(y_train))
+  
+  control <- trainControl(method = "cv",
+                          number = 10,
+                          classProbs = TRUE,
+                          savePredictions = "final",
+                          index = createFolds(y_train, k = 10, returnTrain = TRUE))
+  
+  X_train <- train_set[, -13]
+  
+  lasso_fit <- train(x = X_train,
+                     y = y_train,
+                     method = "glmnet",
+                     family = "binomial",
+                     trControl = control,
+                     tuneGrid = expand.grid(alpha = 1,
+                                            lambda = seq(lambda_range[1], lambda_range[2], length.out = length.out)),
+                     metric = "Accuracy")
+  
+  y_train_numeric <- as.numeric(y_train) - 1
+  lasso_model <- glmnet(x = X_train, y = y_train_numeric, alpha = 1, lambda = lasso_fit$bestTune$lambda)
+  
+  lasso_lambda <- lasso_fit$bestTune$lambda
+  intercept <- lasso_model$a0
+  beta_lasso <- lasso_model$beta
+  
+  return(list("best_model" = lasso_fit$bestTune,
+               "lambda" = lasso_lambda,
+               "intercept" = intercept,
+               "beta" = beta_lasso,
+               "lasso_model" = lasso_model))
+}
+
+result <- train_lasso_model(train_set,c(0.01,0.1),100) # this range is the optimal range after tuning
+result
+```
+
+```{r}
+# Evaluate the performance on the test set
+evaluate_lasso_model <- function(test_set, lasso_model) {
+  X_test <- test_set[, -13] 
+  X_test_matrix <- as.matrix(X_test)
+  lasso_probs <- predict(lasso_model, newx = X_test_matrix, s = lasso_model$lambdaOpt, type = "response")
+  
+  threshold <- 0.5
+  lasso_preds <- ifelse(lasso_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(lasso_preds), as.factor(test_set[, 13]), positive = "1")
+  matrix_data <- cm$table
+  
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+
+
+
+evaluate_lasso_model(test_set, result$lasso_model)
+
+```
+b) Fit model with the data after removing outliers
+```{r}
+result <- train_lasso_model(cleaned_train_set,c(0.01,1),100)
+result
+```
+```{r}
+evaluate_lasso_model(test_set, result$lasso_model)
+```
+(2) Logsitic RidgeRegression  
+
+a) Train the model with the data before removing outliers
+
+```{r}
+train_ridge_model <- function(train_set, lambda_range, length.out) {
+  y_train <- as.factor(train_set[, 13])
+  levels(y_train) <- make.names(levels(y_train))
+  
+  control <- trainControl(method = "cv",
+                          number = 10,
+                          classProbs = TRUE,
+                          savePredictions = "final",
+                          index = createFolds(y_train, k = 10, returnTrain = TRUE))
+  
+  X_train <- train_set[, -13]
+  
+  ridge_fit <- train(x = X_train,
+                     y = y_train,
+                     method = "glmnet",
+                     family = "binomial",
+                     trControl = control,
+                     tuneGrid = expand.grid(alpha = 0,
+                                            lambda = seq(lambda_range[1], lambda_range[2], length.out = length.out)),
+                     metric = "Accuracy")
+  
+  y_train_numeric <- as.numeric(y_train) - 1
+  ridge_model <- glmnet(x = X_train, y = y_train_numeric, alpha = 0, lambda = ridge_fit$bestTune$lambda)
+  
+  ridge_lambda <- ridge_fit$bestTune$lambda
+  intercept <- ridge_model$a0
+  beta_ridge <- ridge_model$beta
+  
+  return(list("best_model" = ridge_fit$bestTune,
+               "lambda" = ridge_lambda,
+               "intercept" = intercept,
+               "beta" = beta_ridge,
+               "ridge_model" = ridge_model))
+}
+
+result <- train_ridge_model(train_set, c(0.01, 0.1), 100)
+result
+
+```
+```{r}
+evaluate_ridge_model <- function(test_set, ridge_model) {
+  X_test <- test_set[, -13] # Assuming the response variable is in the 13th column
+  X_test_matrix <- as.matrix(X_test)
+  ridge_probs <- predict(ridge_model, newx = X_test_matrix, s = ridge_model$lambda, type = "response")
+  
+  threshold <- 0.5
+  ridge_preds <- ifelse(ridge_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(ridge_preds), as.factor(test_set[, 13]), positive = "1")
+  matrix_data <- cm$table
+  
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+
+evaluate_ridge_model(test_set, result$ridge_model)
+
+```
+b)  Train the model with the data after removing outliers
+```{r}
+result <- train_ridge_model(cleaned_train_set, c(0.01, 0.1), 100)
+result
+```
+```{r}
+evaluate_ridge_model(test_set, result$ridge_model)
+```
+(3) Baysian Logistic Model
+
+a) Non-informative priors N(0,10) and double_exp(0,10), all predictors in.
+
+```{r}
+# non_inf_stan_model <- function(prior_intercept_location, prior_intercept_scale, prior_b_location, prior_b_scale) {
+#   # Define the Stan model
+#   non_inf_stan_code <- "
+#   data {
+#     int<lower=0> N; // number of observations
+#     int<lower=0, upper=1> y[N]; // binary outcome
+#     matrix[N, 12] X; // predictor matrix
+#     real prior_intercept_location;
+#     real prior_intercept_scale;
+#     real prior_b_location;
+#     real prior_b_scale;
+#   }
+# 
+#   parameters {
+#     real intercept;
+#     vector[12] b;
+#   }
+# 
+#   model {
+#     vector[N] p;
+# 
+#     // Priors
+#     intercept ~ normal(prior_intercept_location, prior_intercept_scale); 
+#     b ~ double_exponential(prior_b_location, prior_b_scale); 
+#     // Likelihood
+#     p = intercept + X * b;
+#     y ~ bernoulli_logit(p);
+#   }
+#   "
+# 
+#   # Prepare the data for Stan
+#   stan_data <- list(
+#     N = length(train_set$class),
+#     y = train_set$class,
+#     X = X_train[, c('Area', 'Perimeter', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                     'Convex_Area', 'Equiv_Diameter', 'Eccentricity', 'Solidity',
+#                     'Extent', 'Roundness', 'Aspect_Ration', 'Compactness')],
+#     prior_intercept_location = prior_intercept_location,
+#     prior_intercept_scale = prior_intercept_scale,
+#     prior_b_location = prior_b_location,
+#     prior_b_scale = prior_b_scale
+#   )
+# 
+#   # Compile and fit the Stan model
+#   non_inf_stan_mod <- stan(
+#     model_code =  non_inf_stan_code,
+#     data = stan_data,
+#     chains = 3,
+#     iter = 36000, # total number of iterations, including warmup
+#     warmup = 6000, # number of warmup iterations
+#     seed = 123,
+#     cores = 6,
+#     control = list(max_treedepth = 15)
+#   )
+#   
+#   return(non_inf_stan_mod)
+# }
+# 
+# non_inf_mod1 <-  non_inf_stan_model(0, 10, 0, 10)
+
+```
+
+
+```{r}
+stan_diagnostics <- function(fitted_stan_model) {
+  
+  # Gelman-Rubin diagnostic and ESS
+  cat("Gelman-Rubin diagnostic (R-hat) and Effective Sample Size (ESS):\n")
+  print(fitted_stan_model)
+  cat("\n")
+  
+  # Extract posterior samples and convert them to mcmc objects
+  post_samples <- extract(fitted_stan_model, permuted = FALSE)
+  mcmc_objects <- lapply(1:ncol(post_samples), function(i) {
+    mcmc(post_samples[, i, ])
+  })
+  
+  # Geweke diagnostic
+  mcmc_list <- mcmc.list(mcmc_objects)
+  geweke_diag <- geweke.diag(mcmc_list)
+  cat("Geweke diagnostic:\n")
+  print(geweke_diag)
+  cat("\n")
+  
+  # Autocorrelation diagnostic
+  autocorr_diag <- autocorr.diag(mcmc_list)
+  cat("Autocorrelation diagnostic:\n")
+  print(autocorr_diag)
+  cat("\n")
+}
+
+stan_diagnostics(non_inf_mod1)
+```
+
+```{r}
+stan_trace <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+  # Traceplots
+  trace_plots <- mcmc_trace(combined_chains,
+                            pars = c("intercept", paste0("b[", 1:12, "]")),
+                            facet_args = list(nrow = 3, ncol = 5),n_pars = 13)
+  print(trace_plots)
+}
+stan_trace(non_inf_mod1)
+```
+
+```{r}
+stan_dens <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+  # Grid density plots
+  density_plots <- mcmc_dens(combined_chains,
+                             pars = c("intercept", paste0("b[", 1:12, "]")),
+                             facet_args = list(nrow = 3, ncol = 5))
+  print(density_plots)
+}
+stan_dens(non_inf_mod1)
+```
+```{r}
+evaluate_model <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:12, "]")])
+  
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test)
+  
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+
+evaluate_model(non_inf_mod1)
+cat("\n")
+evaluate_model(non_inf_mod1,0.45)
+```
+b) Model 2: Rerun MCMC by removing b[2] and b[5]
+
+```{r}
+
+# non_inf_mod2_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 10] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[10] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10); 
+#   b ~ double_exponential(0, 10); 
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c('Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                   'Equiv_Diameter', 'Eccentricity', 'Solidity',
+#                   'Extent', 'Roundness', 'Aspect_Ration', 'Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod2 <- stan(
+#   model_code = non_inf_mod2_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 6000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+
+```{r}
+stan_diagnostics(non_inf_mod2)
+```
+
+```{r}
+stan_dens_new <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+ # Grid density plots with skipped parameters
+density_plots <- mcmc_dens(combined_chains,
+                           pars = c("intercept", paste0("b[", 1:10, "]")),
+                           facet_args = list(nrow = 3, ncol = 5))
+print(density_plots)
+
+}
+stan_dens_new(non_inf_mod2)
+```
+
+```{r}
+stan_trace_new <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+  # Traceplots
+  trace_plots <- mcmc_trace(combined_chains,
+                            vars = c("intercept", paste0("b[", 1:10, "]")),
+                            facet_args = list(nrow = 3, ncol = 4))
+  print(trace_plots)
+}
+
+stan_trace_new(non_inf_mod2)
+
+```
+
+
+```{r}
+evaluate_model_new <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:10, "]")])
+
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test[, -c(2, 5)]) # Exclude the 2nd and 5th predictors
+
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+evaluate_model_new(non_inf_mod2)
+cat("\n")
+evaluate_model_new(non_inf_mod2,0.45)
+```
+c) Model 3:remove b[2](perimeter),b[5](Convex_Area), b[7] (Eccentricity), and b[11](Aspect_Ration)
+
+```{r}
+# non_inf_mod3_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 8] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[8] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10); 
+#   b ~ double_exponential(0, 10); 
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c('Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                   'Equiv_Diameter', 'Solidity',
+#                   'Extent', 'Roundness', 'Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod3 <- stan(
+#   model_code = non_inf_mod3_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 6000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+
+```{r}
+stan_diagnostics(non_inf_mod3)
+```
+
+```{r}
+stan_dens_new2 <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+ # Grid density plots with skipped parameters
+density_plots <- mcmc_dens(combined_chains,
+                           pars = c("intercept", paste0("b[", 1:8, "]")),
+                           facet_args = list(nrow = 3, ncol = 5))
+print(density_plots)
+
+}
+stan_dens_new2(non_inf_mod3)
+```
+```{r}
+evaluate_model_new2 <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:8, "]")])
+
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test[, -c(2, 5,7,11)]) # Exclude the 2nd,5th,7th,and 11th predictors
+
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+evaluate_model_new2(non_inf_mod3)
+```
+d) Update Model 3: Geweke shows that the mixing of b[2] is not very satisfactory, we can increase the burn-in to fix the problem.
+```{r}
+# non_inf_mod3_code_new <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 8] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[8] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10); 
+#   b ~ double_exponential(0, 10); 
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c('Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                   'Equiv_Diameter', 'Solidity',
+#                   'Extent', 'Roundness', 'Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod3_new <- stan(
+#   model_code = non_inf_mod3_code_new,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+```{r}
+stan_diagnostics(non_inf_mod3_new)
+```
+```{r}
+evaluate_model_new2(non_inf_mod3_new,0.45)
+```
+```{r}
+evaluate_model_new2(non_inf_mod3_new,0.5)
+```
+```{r}
+stan_dens_new2(non_inf_mod3_new)
+```
+```{r}
+ summary(non_inf_mod3_new)$summary[,'mean']
+```
+e) Model 4: Remove Solidity, Extent, and Roundness. 
+
+```{r}
+# non_inf_mod4_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 5] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[5] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10); 
+#   b ~ double_exponential(0, 10); 
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c('Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                   'Equiv_Diameter', 'Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod4<- stan(
+#   model_code = non_inf_mod4_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+# 
+
+```
+```{r}
+stan_diagnostics(non_inf_mod4)
+```
+```{r}
+evaluate_model_new3 <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:5, "]")])
+
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test[, -c(2, 5,7,8,9,10,11)]) # Exclude the 2nd,5th,7th,9th,10th,and 11th predictors
+
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+evaluate_model_new3(non_inf_mod4)
+```
+```{r}
+stan_dens_new3 <- function(stan_model) {
+  # Combine the chains
+  combined_chains <- as.matrix(stan_model)
+  
+ # Grid density plots with skipped parameters
+density_plots <- mcmc_dens(combined_chains,
+                           pars = c("intercept", paste0("b[", 1:5, "]")),
+                           facet_args = list(nrow = 2, ncol = 3))
+print(density_plots)
+
+}
+stan_dens_new3(non_inf_mod4)
+```
+f) Model 5: add 'Solidity' and 'Roundness' back to the model
+
+```{r}
+# non_inf_mod5_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 7] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[7] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10); 
+#   b ~ double_exponential(0, 10); 
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c('Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+#                   'Equiv_Diameter', 'Solidity',
+#                   'Roundness', 'Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod5<- stan(
+#   model_code = non_inf_mod5_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+
+```{r}
+stan_diagnostics(non_inf_mod5)
+```
+```{r}
+evaluate_model_new4 <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:7, "]")])
+
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test[, -c(2,5,7,9,11)]) # Exclude the 2nd,5th,7th,9th,and 11th predictors
+
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+evaluate_model_new4(non_inf_mod5)
+cat("\n")
+evaluate_model_new4(non_inf_mod5,0.45) # adjust the probability threshold 
+```
+```{r warning=FALSE}
+
+# Extract the mean coefficients from the summary table
+coefficients <- head(summary(non_inf_mod5)$summary[,'mean'], -1)
+
+names <- c('Intercept', 'Area', 'Major_Axis_Length', 'Minor_Axis_Length',
+            'Equiv_Diameter', 'Solidity', 'Roundness', 'Compactness')
+
+cbind(names, round(coefficients, 3))
+
+```
+
+(4) What if we adopt the predictors(shown below) selected by the Lasso model?
+
+Area               .
+Perimeter          .
+Major_Axis_Length -0.014201437 ✓
+Minor_Axis_Length  .
+Convex_Area        .
+Equiv_Diameter     .
+Eccentricity       .
+Solidity          -0.058495715 ✓
+Extent             .
+Roundness          0.063653658 ✓
+Aspect_Ration     -0.003888242 ✓
+Compactness        0.276571762 ✓
+
+```{r}
+# non_inf_mod6_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 5] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[5] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 10);
+#   b ~ double_exponential(0, 10);
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c( 'Major_Axis_Length', 'Solidity',
+#                   'Roundness', 'Aspect_Ration','Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod6<- stan(
+#   model_code = non_inf_mod6_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+
+```
+```{r}
+stan_diagnostics(non_inf_mod6)
+```
+
+```{r}
+evaluate_model_new6 <- function(stan_model, threshold = 0.5) {
+  # Calculate the posterior mean of the parameters
+  posterior_mean <- summary(stan_model)$summary[,'mean']
+  posterior_mean <- posterior_mean[!names(posterior_mean) %in% "lp__"]
+  
+  # Function to calculate the predicted probabilities using the posterior mean
+  predict_prob <- function(X, intercept, b) {
+    p <- plogis(intercept + X %*% b)
+    return(p)
+  }
+  
+  # Convert the named vector to a simple numeric vector
+  b_numeric <- as.numeric(posterior_mean[paste0("b[", 1:5, "]")])
+
+  # Convert X_test to a matrix if necessary
+  X_test_matrix <- as.matrix(X_test[, -c(1,2,4,5,6,7,9)]) 
+
+  # Calculate the predicted probabilities for the test set
+  predicted_probs <- predict_prob(X_test_matrix, posterior_mean["intercept"], b_numeric)
+  
+  # Convert probabilities to class labels based on a threshold
+  predicted_class <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  cm <- confusionMatrix(as.factor(predicted_class), as.factor(test_set$class), positive = "1")
+  matrix_data <- cm$table
+  
+  # Calculate metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Print metrics
+  cat("Accuracy:", accuracy, "\n")
+  cat("Precision:", precision, "\n")
+  cat("Recall:", recall, "\n")
+  cat("Specificity:", specificity, "\n")
+  cat("F1-score:", f1_score, "\n")
+}
+
+```
+
+(5) Will smaller scales(which means greater regularization) perform better? Change to the scales of the priors to 5.
+
+```{r}
+# non_inf_mod7_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 5] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[5] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 5);
+#   b ~ double_exponential(0, 5);
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c( 'Major_Axis_Length', 'Solidity',
+#                   'Roundness', 'Aspect_Ration','Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod7<- stan(
+#   model_code = non_inf_mod7_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+
+```{r}
+stan_diagnostics(non_inf_mod7)
+```
+
+```{r}
+evaluate_model_new6(non_inf_mod7)
+```
+
+
+```{r}
+# non_inf_mod8_code <- "
+# data {
+#   int<lower=0> N; // number of observations
+#   int<lower=0, upper=1> y[N]; // binary outcome
+#   matrix[N, 5] X; // predictor matrix
+# }
+# 
+# parameters {
+#   real intercept;
+#   vector[5] b;
+# }
+# 
+# model {
+#   vector[N] p;
+# 
+#   // Priors
+#   intercept ~ normal(0, 1);
+#   b ~ double_exponential(0, 1);
+#   // Likelihood
+#   p = intercept + X * b;
+#   y ~ bernoulli_logit(p);
+# }
+# "
+# 
+# # Prepare the data for Stan
+# stan_data <- list(
+#   N = length(train_set$class),
+#   y = train_set$class,
+#   X = X_train[, c( 'Major_Axis_Length', 'Solidity',
+#                   'Roundness', 'Aspect_Ration','Compactness')]
+# )
+# 
+# # Compile and fit the Stan model
+# non_inf_mod8<- stan(
+#   model_code = non_inf_mod8_code,
+#   data = stan_data,
+#   chains = 3,
+#   iter = 36000, # total number of iterations, including warmup
+#   warmup = 10000, # number of warmup iterations
+#   seed = 123,
+#   cores = 6,
+#   control = list(max_treedepth = 15)
+# )
+
+```
+
+```{r}
+stan_diagnostics(non_inf_mod8)
+```
+
+```{r}
+evaluate_model_new6(non_inf_mod6) # Lasso predictors with scale=10
+cat('\n')
+evaluate_model_new6(non_inf_mod7) # Lasso predictors with scale=5
+cat('\n')
+evaluate_model_new6(non_inf_mod8) # Lasso predictors with scale=1
+```
+```{r}
+evaluate_model_new4(non_inf_mod5)
+cat("\n")
+evaluate_model_new4(non_inf_mod5,0.45) # adjust the probability threshold to increase performance
+cat("\n")
+evaluate_model_new6(non_inf_mod6)
+cat("\n")
+evaluate_model_new6(non_inf_mod6,0.48) # adjust the probability threshold to increase performance
+```
+
+```{r}
+# save(non_inf_mod1, non_inf_mod2, non_inf_mod3,non_inf_mod3_new,non_inf_mod4,non_inf_mod5,non_inf_mod6,non_inf_mod7,non_inf_mod8, file = "Stan_8mod.Rdata") 
+```
+
+
